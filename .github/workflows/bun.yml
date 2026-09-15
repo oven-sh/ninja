@@ -26,7 +26,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # `docker run` rather than `container:` — JavaScript actions do not run inside Alpine containers on arm64 runners.
       - name: Build and test in Alpine
         run: |
@@ -43,7 +43,7 @@ jobs:
         run: |
           mkdir artifact
           cd build-release && zip ../artifact/ninja-linux-${{ matrix.arch }}.zip ninja
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ninja-linux-${{ matrix.arch }}
           path: artifact/ninja-linux-${{ matrix.arch }}.zip
@@ -60,7 +60,7 @@ jobs:
             runner: macos-15
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build and test
         run: |
           cmake -B build-release -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
@@ -73,7 +73,7 @@ jobs:
         run: |
           mkdir artifact
           cd build-release && zip ../artifact/ninja-darwin-${{ matrix.arch }}.zip ninja
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ninja-darwin-${{ matrix.arch }}
           path: artifact/ninja-darwin-${{ matrix.arch }}.zip
@@ -92,7 +92,7 @@ jobs:
             cmake-arch: ARM64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build and test
         shell: pwsh
         run: |
@@ -107,7 +107,7 @@ jobs:
         run: |
           New-Item -ItemType Directory artifact | Out-Null
           Compress-Archive -Path build-release\Release\ninja.exe -DestinationPath artifact\ninja-windows-${{ matrix.arch }}.zip
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ninja-windows-${{ matrix.arch }}
           path: artifact/ninja-windows-${{ matrix.arch }}.zip
@@ -121,7 +121,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: artifact
           merge-multiple: true
