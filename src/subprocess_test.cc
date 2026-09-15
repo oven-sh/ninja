@@ -14,6 +14,10 @@
 
 #include "subprocess.h"
 
+#include "early_output.h"
+
+#include <algorithm>
+
 #include "exit_status.h"
 #include "test.h"
 
@@ -197,14 +201,14 @@ TEST_F(SubprocessTest, Console) {
 #endif
 
 // Lines carrying the announce prefix are taken out of the output.
-TEST_F(SubprocessTest, NotificationsAreExtracted) {
+TEST_F(SubprocessTest, EarlyOutputsAreExtracted) {
   Subprocess* subproc =
       subprocs_.Add("echo @ready@out/a.meta", false, "@ready@");
   ASSERT_NE((Subprocess*)0, subproc);
   while (!subproc->Done())
     subprocs_.DoWork();
   ASSERT_EQ(ExitSuccess, subproc->Finish());
-  std::vector<std::string> notified = subproc->TakeNotifications();
+  std::vector<std::string> notified = subproc->TakeEarlyOutputs();
   ASSERT_EQ(1u, notified.size());
   EXPECT_EQ("out/a.meta", notified[0]);
   EXPECT_EQ("", subproc->GetOutput());
@@ -213,22 +217,22 @@ TEST_F(SubprocessTest, NotificationsAreExtracted) {
 #ifndef _WIN32
 // An announcement is reported while the command is still running, and the
 // rest of the output is left alone.
-TEST_F(SubprocessTest, NotificationBeforeExit) {
+TEST_F(SubprocessTest, EarlyOutputBeforeExit) {
   Subprocess* subproc = subprocs_.Add(
       "echo before; echo @ready@a.meta; echo not@ready@b; sleep 1; echo after",
       false, "@ready@");
   ASSERT_NE((Subprocess*)0, subproc);
   SubprocessSet::WorkResult result = SubprocessSet::WorkResult::NoWork;
-  while (result != SubprocessSet::WorkResult::OutputNotified) {
+  while (result != SubprocessSet::WorkResult::EarlyOutput) {
     ASSERT_FALSE(subproc->Done());
     result = subprocs_.DoWork();
   }
   EXPECT_FALSE(subproc->Done());
-  EXPECT_EQ(subproc, subprocs_.NextNotified());
-  std::vector<std::string> notified = subproc->TakeNotifications();
+  EXPECT_EQ(subproc, subprocs_.NextWithEarlyOutputs());
+  std::vector<std::string> notified = subproc->TakeEarlyOutputs();
   ASSERT_EQ(1u, notified.size());
   EXPECT_EQ("a.meta", notified[0]);
-  EXPECT_EQ((Subprocess*)0, subprocs_.NextNotified());
+  EXPECT_EQ((Subprocess*)0, subprocs_.NextWithEarlyOutputs());
 
   while (!subproc->Done())
     subprocs_.DoWork();
@@ -236,6 +240,141 @@ TEST_F(SubprocessTest, NotificationBeforeExit) {
   EXPECT_EQ("before\nnot@ready@b\nafter\n", subproc->GetOutput());
 }
 #endif
+
+
+#ifndef _WIN32
+// REVIEW TESTS BEGIN
+// A marker line that arrives in two reads is still recognised.
+TEST_F(SubprocessTest, EarlyOutputSplitAcrossReads) {
+  Subprocess* subproc = subprocs_.Add(
+      "printf 'x\\n@rea'; sleep 0.2; printf 'dy@a.meta\\ny\\n'", false,
+      "@ready@");
+  ASSERT_NE((Subprocess*)0, subproc);
+  while (!subproc->Done())
+    subprocs_.DoWork();
+  ASSERT_EQ(ExitSuccess, subproc->Finish());
+  std::vector<std::string> notified = subproc->TakeEarlyOutputs();
+  ASSERT_EQ(1u, notified.size());
+  EXPECT_EQ("a.meta", notified[0]);
+  EXPECT_EQ("x\ny\n", subproc->GetOutput());
+}
+
+TEST_F(SubprocessTest, EarlyOutputCRLF) {
+  Subprocess* subproc = subprocs_.Add(
+      "printf '@ready@a.meta\\r\\n@ready@\\r\\n@ready@\\n'", false, "@ready@");
+  ASSERT_NE((Subprocess*)0, subproc);
+  while (!subproc->Done())
+    subprocs_.DoWork();
+  ASSERT_EQ(ExitSuccess, subproc->Finish());
+  std::vector<std::string> notified = subproc->TakeEarlyOutputs();
+  ASSERT_EQ(3u, notified.size());
+  EXPECT_EQ("a.meta", notified[0]);
+  EXPECT_EQ("", notified[1]);
+  EXPECT_EQ("", notified[2]);
+  EXPECT_EQ("", subproc->GetOutput());
+}
+
+// A marker that is not terminated by a newline is not an announcement and
+// stays in the output.
+TEST_F(SubprocessTest, EarlyOutputWithoutNewlineAtEOF) {
+  Subprocess* subproc =
+      subprocs_.Add("printf 'x\\n@ready@a.meta'", false, "@ready@");
+  ASSERT_NE((Subprocess*)0, subproc);
+  while (!subproc->Done())
+    subprocs_.DoWork();
+  ASSERT_EQ(ExitSuccess, subproc->Finish());
+  EXPECT_FALSE(subproc->HasEarlyOutputs());
+  EXPECT_EQ("x\n@ready@a.meta", subproc->GetOutput());
+}
+
+// Two commands announce at the same time; both are reported.
+TEST_F(SubprocessTest, EarlyOutputsFromTwoSubprocesses) {
+  Subprocess* a = subprocs_.Add("echo @ready@a; sleep 1", false, "@ready@");
+  Subprocess* b = subprocs_.Add("echo @ready@b; sleep 1", false, "@ready@");
+  ASSERT_NE((Subprocess*)0, a);
+  ASSERT_NE((Subprocess*)0, b);
+  std::vector<std::string> seen;
+  while (seen.size() < 2) {
+    ASSERT_FALSE(a->Done());
+    ASSERT_FALSE(b->Done());
+    Subprocess* n = subprocs_.NextWithEarlyOutputs();
+    if (!n) {
+      subprocs_.DoWork();
+      continue;
+    }
+    std::vector<std::string> taken = n->TakeEarlyOutputs();
+    seen.insert(seen.end(), taken.begin(), taken.end());
+  }
+  std::sort(seen.begin(), seen.end());
+  EXPECT_EQ("a", seen[0]);
+  EXPECT_EQ("b", seen[1]);
+  while (!a->Done() || !b->Done())
+    subprocs_.DoWork();
+}
+
+// An announcement made right before exit: DoWork() reports the exit, and
+// the subprocess is no longer offered by NextWithEarlyOutputs().
+TEST_F(SubprocessTest, EarlyOutputWithExit) {
+  Subprocess* subproc = subprocs_.Add("echo @ready@a", false, "@ready@");
+  ASSERT_NE((Subprocess*)0, subproc);
+  SubprocessSet::WorkResult result = SubprocessSet::WorkResult::NoWork;
+  while (result != SubprocessSet::WorkResult::SubprocFinished) {
+    result = subprocs_.DoWork();
+    if (result == SubprocessSet::WorkResult::EarlyOutput)
+      break;  // the two events did not coincide; nothing to check
+  }
+  if (result == SubprocessSet::WorkResult::SubprocFinished) {
+    EXPECT_EQ((Subprocess*)0, subprocs_.NextWithEarlyOutputs());
+    EXPECT_EQ(subproc, subprocs_.NextFinished());
+  }
+}
+
+// Without a prefix nothing is scanned.
+TEST_F(SubprocessTest, NoEarlyOutputsWithoutPrefix) {
+  Subprocess* subproc = subprocs_.Add("echo @ready@a");
+  ASSERT_NE((Subprocess*)0, subproc);
+  while (!subproc->Done())
+    subprocs_.DoWork();
+  EXPECT_FALSE(subproc->HasEarlyOutputs());
+  EXPECT_EQ("@ready@a\n", subproc->GetOutput());
+}
+// REVIEW TESTS END
+#endif
+
+// The command learns the prefix from its environment, and only when ninja is
+// listening for it.
+TEST_F(SubprocessTest, EarlyOutputPrefixInEnvironment) {
+#ifdef _WIN32
+  const char* kAnnounce = "cmd /c echo %NINJA_EARLY_OUTPUT_PREFIX%a.meta";
+  const char* kShow = "cmd /c echo [%NINJA_EARLY_OUTPUT_PREFIX%]";
+  const char* kUnset = "[%NINJA_EARLY_OUTPUT_PREFIX%]";
+  _putenv_s(kEarlyOutputPrefixEnvVar, "inherited");
+#else
+  const char* kAnnounce = "echo \"${NINJA_EARLY_OUTPUT_PREFIX}a.meta\"";
+  const char* kShow = "echo \"[${NINJA_EARLY_OUTPUT_PREFIX}]\"";
+  const char* kUnset = "[]";
+  setenv(kEarlyOutputPrefixEnvVar, "inherited", 1);
+#endif
+  Subprocess* announcer = subprocs_.Add(kAnnounce, false, "@ready@");
+  ASSERT_NE((Subprocess*)0, announcer);
+  // Without a prefix the variable is absent, even though ninja inherited one.
+  Subprocess* plain = subprocs_.Add(kShow);
+  ASSERT_NE((Subprocess*)0, plain);
+  while (!announcer->Done() || !plain->Done())
+    subprocs_.DoWork();
+#ifdef _WIN32
+  _putenv_s(kEarlyOutputPrefixEnvVar, "");
+#else
+  unsetenv(kEarlyOutputPrefixEnvVar);
+#endif
+  ASSERT_EQ(ExitSuccess, announcer->Finish());
+  ASSERT_EQ(ExitSuccess, plain->Finish());
+  std::vector<std::string> early = announcer->TakeEarlyOutputs();
+  ASSERT_EQ(1u, early.size());
+  EXPECT_EQ("a.meta", early[0]);
+  EXPECT_EQ("", announcer->GetOutput());
+  EXPECT_NE(std::string::npos, plain->GetOutput().find(kUnset));
+}
 
 TEST_F(SubprocessTest, SetWithSingle) {
   Subprocess* subproc = subprocs_.Add(kSimpleCommand);

@@ -57,6 +57,27 @@ TEST_F(ParserTest, Rules) {
             rule->GetBinding("command")->Serialize());
 }
 
+TEST_F(ParserTest, EarlyOutputPrefix) {
+  // Accepted on a rule (older Ninja versions reject it there with
+  // "unexpected variable") and overridable on a build statement.
+  ASSERT_NO_FATAL_FAILURE(AssertParse(
+"rule r\n"
+"  command = r $out\n"
+"  early_output_prefix = @ready@\n"
+"build a.meta a.obj: r\n"
+"build b.meta b.obj: r\n"
+"  early_output_prefix = ##\n"
+"build c: r\n"
+"  early_output_prefix =\n"));
+  EXPECT_EQ("@ready@",
+            state.GetNode("a.meta", 0)->in_edge()->GetBinding(
+                "early_output_prefix"));
+  EXPECT_EQ("##", state.GetNode("b.obj", 0)->in_edge()->GetBinding(
+                      "early_output_prefix"));
+  EXPECT_EQ("", state.GetNode("c", 0)->in_edge()->GetBinding(
+                    "early_output_prefix"));
+}
+
 TEST_F(ParserTest, RuleAttributes) {
   // Check that all of the allowed rule attributes are parsed ok.
   ASSERT_NO_FATAL_FAILURE(AssertParse(

@@ -112,12 +112,12 @@ BuildResult RealCommandRunner::WaitForCommandOrJobserverToken(
   }
 #endif
 
-  // Announcements are delivered before the completion of any command, so
+  // Early outputs are delivered before the completion of any command, so
   // that they are never outlived by their subprocess.
   SubprocessSet::WorkResult work_result = SubprocessSet::WorkResult::NoWork;
-  Subprocess* notified = subprocs_.NextNotified();
-  if (notified) {
-    work_result = SubprocessSet::WorkResult::OutputNotified;
+  Subprocess* announcer = subprocs_.NextWithEarlyOutputs();
+  if (announcer) {
+    work_result = SubprocessSet::WorkResult::EarlyOutput;
   } else if (subprocs_.HasFinished()) {
     work_result = SubprocessSet::WorkResult::SubprocFinished;
   }
@@ -125,9 +125,9 @@ BuildResult RealCommandRunner::WaitForCommandOrJobserverToken(
   // Wait for DoWork() to report activity
   while (work_result == SubprocessSet::WorkResult::NoWork) {
     work_result = subprocs_.DoWork();
-    if (work_result == SubprocessSet::WorkResult::OutputNotified) {
-      notified = subprocs_.NextNotified();
-      if (!notified)
+    if (work_result == SubprocessSet::WorkResult::EarlyOutput) {
+      announcer = subprocs_.NextWithEarlyOutputs();
+      if (!announcer)
         work_result = SubprocessSet::WorkResult::NoWork;
     }
   }
@@ -154,12 +154,12 @@ BuildResult RealCommandRunner::WaitForCommandOrJobserverToken(
       build_result = BuildResult::CommandCompleted(edge, status, std::move(output));
       break;
     }
-    case SubprocessSet::WorkResult::OutputNotified:
+    case SubprocessSet::WorkResult::EarlyOutput:
     {
-      BuildResult::OutputsReady ready;
-      ready.edge = subproc_to_edge_.find(notified)->second;
-      ready.paths = notified->TakeNotifications();
-      build_result = std::move(ready);
+      BuildResult::EarlyOutputs early;
+      early.edge = subproc_to_edge_.find(announcer)->second;
+      early.paths = announcer->TakeEarlyOutputs();
+      build_result = std::move(early);
       break;
     }
     case SubprocessSet::WorkResult::JobserverTokenAvailable:

@@ -773,9 +773,22 @@ BuildResult FakeCommandRunner::WaitForCommand() {
        e != active_edges_.end(); ++e) {
     if (!(*e)->GetBinding("early_output_prefix").empty() &&
         announced_.insert(*e).second) {
-      BuildResult::OutputsReady ready;
+      BuildResult::EarlyOutputs ready;
       ready.edge = *e;
-      ready.paths.push_back((*e)->outputs_[0]->path());
+      // Tests may override what is announced: '|'-separated paths.
+      string announce = (*e)->GetBinding("test_early_outputs");
+      if (announce.empty()) {
+        ready.paths.push_back((*e)->outputs_[0]->path());
+      } else {
+        size_t pos = 0;
+        for (;;) {
+          size_t bar = announce.find('|', pos);
+          ready.paths.push_back(announce.substr(pos, bar - pos));
+          if (bar == string::npos)
+            break;
+          pos = bar + 1;
+        }
+      }
       return ready;
     }
   }
@@ -846,6 +859,7 @@ BuildResult FakeCommandRunner::WaitForCommand() {
   }
 
   active_edges_.erase(edge_iter);
+  announced_.erase(edge);
   if (!edge->outputs_.empty())
     completed_.push_back(edge->outputs_[0]->path());
   return BuildResult::CommandCompleted{edge, status, output};
@@ -857,6 +871,7 @@ vector<Edge*> FakeCommandRunner::GetActiveEdges() {
 
 void FakeCommandRunner::Abort() {
   active_edges_.clear();
+  announced_.clear();
 }
 
 void BuildTest::Dirty(const string& path) {
@@ -1617,6 +1632,248 @@ TEST_F(BuildTest, NoEarlyOutputWithoutBinding) {
   EXPECT_EQ("final", command_runner_.completed_[2]);
 }
 
+
+// REVIEW TESTS BEGIN
+TEST_F(BuildTest, EarlyOutputConsumerOfBothWaits) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"build a.meta a.obj: cat in1\n"
+"  early_output_prefix = @ready@\n"
+"build c: cat a.meta a.obj\n"));
+  command_runner_.max_active_edges_ = 2;
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("c", &err));
+  ASSERT_EQ("", err);
+  EXPECT_EQ(builder_.Build(&err), ExitSuccess);
+  ASSERT_EQ("", err);
+  ASSERT_EQ(2u, command_runner_.completed_.size());
+  EXPECT_EQ("a.meta", command_runner_.completed_[0]);
+  EXPECT_EQ("c", command_runner_.completed_[1]);
+}
+
+TEST_F(BuildTest, EarlyOutputThroughPhony) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"build a.meta a.obj: cat in1\n"
+"  early_output_prefix = @ready@\n"
+"build alias: phony a.meta\n"
+"build b: cat alias\n"
+"build final: cat b a.obj\n"));
+  command_runner_.max_active_edges_ = 2;
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("final", &err));
+  ASSERT_EQ("", err);
+  EXPECT_EQ(builder_.Build(&err), ExitSuccess);
+  ASSERT_EQ("", err);
+  ASSERT_EQ(3u, command_runner_.completed_.size());
+  EXPECT_EQ("b", command_runner_.completed_[0]);
+  EXPECT_EQ("a.meta", command_runner_.completed_[1]);
+  EXPECT_EQ("final", command_runner_.completed_[2]);
+}
+
+// Announced paths are canonicalized; duplicates, paths that are not outputs
+// of the edge (unknown, an input, another edge's output) are ignored.
+TEST_F(BuildTest, EarlyOutputOddPaths) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"build a.meta a.obj: cat in1\n"
+"  early_output_prefix = @ready@\n"
+"  test_early_outputs = bogus|in1|cat1||./x/../a.meta|a.meta|/abs/a.meta\n"
+"build b: cat a.meta\n"
+"build final: cat b a.obj cat1\n"));
+  command_runner_.max_active_edges_ = 3;
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("final", &err));
+  ASSERT_EQ("", err);
+  EXPECT_EQ(builder_.Build(&err), ExitSuccess);
+  ASSERT_EQ("", err);
+  ASSERT_EQ(4u, command_runner_.commands_ran_.size());
+  ASSERT_EQ(4u, command_runner_.completed_.size());
+  EXPECT_EQ("final", command_runner_.completed_[3]);
+}
+
+// Announcing the last output too must not make consumers of all outputs
+// start before the command has exited?  (It does: documents the behaviour.)
+TEST_F(BuildTest, EarlyOutputAllOutputsAnnounced) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"build a.meta a.obj: cat in1\n"
+"  early_output_prefix = @ready@\n"
+"  test_early_outputs = a.meta|a.obj\n"
+"build c: cat a.meta a.obj\n"));
+  command_runner_.max_active_edges_ = 2;
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("c", &err));
+  EXPECT_EQ(builder_.Build(&err), ExitSuccess);
+  ASSERT_EQ("", err);
+  ASSERT_EQ(2u, command_runner_.completed_.size());
+  EXPECT_EQ("c", command_runner_.completed_[0]);
+  EXPECT_EQ("a.meta", command_runner_.completed_[1]);
+}
+
+// Producer and consumer share a pool of depth 1: the announcing command
+// keeps its pool slot, so the consumer is delayed until it exits.
+TEST_F(BuildTest, EarlyOutputPoolDepthOne) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"pool p\n"
+"  depth = 1\n"
+"build a.meta a.obj: cat in1\n"
+"  early_output_prefix = @ready@\n"
+"  pool = p\n"
+"build b: cat a.meta\n"
+"  pool = p\n"
+"build b2: cat a.meta\n"
+"  pool = p\n"
+"build final: cat b b2 a.obj\n"));
+  command_runner_.max_active_edges_ = 4;
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("final", &err));
+  ASSERT_EQ("", err);
+  EXPECT_EQ(builder_.Build(&err), ExitSuccess);
+  ASSERT_EQ("", err);
+  ASSERT_EQ(4u, command_runner_.completed_.size());
+  EXPECT_EQ("a.meta", command_runner_.completed_[0]);
+  EXPECT_EQ("final", command_runner_.completed_[3]);
+}
+
+// The producer fails after its consumer has already completed.
+TEST_F(BuildTest, EarlyOutputProducerFails) {
+  // touch-fail-tick2 writes its outputs and then fails (at tick 2): only an
+  // output that exists is released.
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"rule touch-fail-tick2\n"
+"  command = touch-fail-tick2\n"
+"build a.meta a.obj: touch-fail-tick2 in1\n"
+"  early_output_prefix = @ready@\n"
+"build b: cat a.meta\n"
+"build final: cat b a.obj\n"));
+  fs_.Tick();
+  command_runner_.max_active_edges_ = 2;
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("final", &err));
+  ASSERT_EQ("", err);
+  EXPECT_EQ(builder_.Build(&err), ExitFailure);
+  EXPECT_EQ("subcommand failed", err);
+  ASSERT_EQ(2u, command_runner_.completed_.size());
+  EXPECT_EQ("b", command_runner_.completed_[0]);
+  EXPECT_EQ("a.meta", command_runner_.completed_[1]);
+}
+
+// -k: the producer fails with a consumer of the announced output still
+// queued (only one job slot).  Is the consumer started after the failure?
+TEST_F(BuildTest, EarlyOutputProducerFailsKeepGoing) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"rule fail\n"
+"  command = fail\n"
+"build a.meta a.obj: fail in1\n"
+"  early_output_prefix = @ready@\n"
+"build b: cat a.meta\n"
+"build final: cat b a.obj\n"));
+  config_.failures_allowed = 2;
+  command_runner_.max_active_edges_ = 1;
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("final", &err));
+  ASSERT_EQ("", err);
+  EXPECT_EQ(builder_.Build(&err), ExitFailure);
+  EXPECT_EQ("cannot make progress due to previous errors", err);
+  // Upstream semantics without the binding: only the failing command runs.
+  EXPECT_EQ(1u, command_runner_.commands_ran_.size());
+}
+
+// A dyndep file announced early: its consumer must not start before the
+// dyndep information is loaded.
+TEST_F(BuildTest, EarlyOutputIsDyndepFile) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"rule touch\n"
+"  command = touch $out\n"
+"rule cp\n"
+"  command = cp $in $out\n"
+"build dd: cp dd-in\n"
+"  early_output_prefix = @ready@\n"
+"build extra: touch\n"
+"build out: touch || dd\n"
+"  dyndep = dd\n"));
+  fs_.Create("dd-in",
+"ninja_dyndep_version = 1\n"
+"build out: dyndep | extra\n");
+  command_runner_.max_active_edges_ = 2;
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("out", &err));
+  EXPECT_EQ("", err);
+  EXPECT_EQ(builder_.Build(&err), ExitSuccess);
+  EXPECT_EQ("", err);
+  // "extra" is discovered through the dyndep file and must be built
+  // before "out".
+  ASSERT_EQ(3u, command_runner_.commands_ran_.size());
+  EXPECT_EQ("cp dd-in dd", command_runner_.commands_ran_[0]);
+  EXPECT_EQ("touch extra", command_runner_.commands_ran_[1]);
+  EXPECT_EQ("touch out", command_runner_.commands_ran_[2]);
+}
+
+// The consumer is interrupted while the announcing producer is running:
+// the outputs of both active commands are cleaned up.
+TEST_F(BuildTest, EarlyOutputInterrupt) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"rule touch-interrupt\n"
+"  command = touch-interrupt\n"
+"build a.meta a.obj: cat in1\n"
+"  early_output_prefix = @ready@\n"
+"build z: touch-interrupt a.meta\n"));
+  command_runner_.max_active_edges_ = 2;
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("z", &err));
+  EXPECT_TRUE(builder_.AddTarget("a.obj", &err));
+  ASSERT_EQ("", err);
+  EXPECT_EQ(builder_.Build(&err), ExitInterrupted);
+  EXPECT_EQ("interrupted by user", err);
+  builder_.Cleanup();
+  EXPECT_EQ(0, fs_.Stat("a.meta", &err));
+  EXPECT_EQ(0, fs_.Stat("a.obj", &err));
+  EXPECT_EQ(0, fs_.Stat("z", &err));
+}
+
+TEST_F(PlanTest, EarlyOutputReady) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"build a.meta a.obj: cat in\n"
+"build b: cat a.meta\n"
+"build final: cat b a.obj\n"));
+  GetNode("a.meta")->MarkDirty();
+  GetNode("a.obj")->MarkDirty();
+  GetNode("b")->MarkDirty();
+  GetNode("final")->MarkDirty();
+  PrepareForTarget("final");
+
+  Edge* producer = plan_.FindWork();
+  ASSERT_TRUE(producer);
+  ASSERT_EQ("a.meta", producer->outputs_[0]->path());
+  ASSERT_FALSE(plan_.FindWork());
+
+  string err;
+  ASSERT_TRUE(plan_.EarlyOutputReady(GetNode("a.meta"), &err));
+  ASSERT_EQ("", err);
+  EXPECT_TRUE(GetNode("a.meta")->ready_early());
+  EXPECT_FALSE(producer->outputs_ready());
+
+  Edge* b = plan_.FindWork();
+  ASSERT_TRUE(b);
+  ASSERT_EQ("b", b->outputs_[0]->path());
+  ASSERT_FALSE(plan_.FindWork());
+
+  // Announcing twice is harmless.
+  ASSERT_TRUE(plan_.EarlyOutputReady(GetNode("a.meta"), &err));
+  ASSERT_FALSE(plan_.FindWork());
+
+  // b finishes first; final still waits for a.obj.
+  ASSERT_TRUE(plan_.EdgeFinished(b, Plan::kEdgeSucceeded, &err));
+  ASSERT_FALSE(plan_.FindWork());
+  ASSERT_TRUE(plan_.more_to_do());
+
+  ASSERT_TRUE(plan_.EdgeFinished(producer, Plan::kEdgeSucceeded, &err));
+  Edge* final = plan_.FindWork();
+  ASSERT_TRUE(final);
+  ASSERT_EQ("final", final->outputs_[0]->path());
+  ASSERT_FALSE(plan_.FindWork());
+  ASSERT_TRUE(plan_.EdgeFinished(final, Plan::kEdgeSucceeded, &err));
+  ASSERT_FALSE(plan_.more_to_do());
+}
+// REVIEW TESTS END
+
 TEST_F(BuildTest, PoolEdgesReadyButNotWanted) {
   fs_.Create("x", "");
 
@@ -1821,6 +2078,51 @@ TEST_F(BuildWithLogTest, RebuildWithNoInputs) {
   EXPECT_EQ(builder_.Build(&err), ExitSuccess);
   EXPECT_EQ("", err);
   EXPECT_EQ(1u, command_runner_.commands_ran_.size());
+}
+
+// restat producer leaves the announced output untouched while its consumer
+// is already running.
+TEST_F(BuildWithLogTest, EarlyOutputRestat) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"rule true\n"
+"  command = true\n"
+"  restat = 1\n"
+"build m.meta m.obj: true in\n"
+"  early_output_prefix = @ready@\n"
+"build b: cat m.meta\n"
+"build final: cat b m.obj\n"));
+  fs_.Create("m.meta", "");
+  fs_.Create("m.obj", "");
+  fs_.Tick();
+  fs_.Create("in", "");
+  command_runner_.max_active_edges_ = 2;
+
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("final", &err));
+  ASSERT_EQ("", err);
+  EXPECT_EQ(builder_.Build(&err), ExitSuccess);
+  ASSERT_EQ("", err);
+  EXPECT_EQ(3u, command_runner_.commands_ran_.size());
+  EXPECT_TRUE(command_runner_.active_edges_.empty());
+
+  command_runner_.commands_ran_.clear();
+  command_runner_.completed_.clear();
+  state_.Reset();
+  fs_.Tick();
+  fs_.Create("in", "");
+
+  // "true" does not touch m.meta/m.obj.  Without the binding only "true"
+  // would run and restat would cancel b and final.
+  EXPECT_TRUE(builder_.AddTarget("final", &err));
+  ASSERT_EQ("", err);
+  EXPECT_EQ(builder_.Build(&err), ExitSuccess);
+  ASSERT_EQ("", err);
+  // No command may be left running when Build() returns success.
+  EXPECT_TRUE(command_runner_.active_edges_.empty());
+  for (size_t i = 0; i < command_runner_.commands_ran_.size(); ++i)
+    printf("ran: %s\n", command_runner_.commands_ran_[i].c_str());
+  for (size_t i = 0; i < command_runner_.completed_.size(); ++i)
+    printf("completed: %s\n", command_runner_.completed_[i].c_str());
 }
 
 TEST_F(BuildWithLogTest, RestatTest) {

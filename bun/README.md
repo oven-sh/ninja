@@ -9,19 +9,24 @@ change here has to keep that true (see "Compatibility").
 
 | Change | Why | Upstream |
 | --- | --- | --- |
-| `early_output_prefix` edge binding: a running command announces, on its output, that one of its outputs is complete; ninja releases that output to the edges consuming it while the command keeps running. | `rustc` writes a crate's `.rmeta` (all that dependent crates need) long before it has generated the `.rlib`. With this, a crate is one edge and one `rustc` process and its dependents still start as early as they do under cargo. Without it they wait for the whole compile. | Requested in [ninja-build/ninja#2286](https://github.com/ninja-build/ninja/issues/2286); not yet proposed as a pull request. |
+| `early_output_prefix` edge binding: a running command announces, on its output, that one of its outputs is complete; ninja releases that output to the edges consuming it while the command keeps running. The command finds the prefix in `NINJA_EARLY_OUTPUT_PREFIX`. | `rustc` writes a crate's `.rmeta` (all that dependent crates need) long before it has generated the `.rlib`. With this, a crate is one edge and one `rustc` process and its dependents still start as early as they do under cargo. Without it they wait for the whole compile. | Requested in [ninja-build/ninja#2286](https://github.com/ninja-build/ninja/issues/2286); not yet proposed as a pull request. |
 | `.github/workflows/bun.yml`, this directory | Builds and publishes the binaries. | Fork only. |
 
-The feature is documented in `doc/manual.asciidoc` under `early_output_prefix` and tested in
-`src/subprocess_test.cc` and `src/build_test.cc`.
+The feature is documented in `doc/manual.asciidoc` under `early_output_prefix`. The output filter is
+`src/early_output.{h,cc}`; tests are in `src/early_output_test.cc`, `src/subprocess_test.cc`,
+`src/build_test.cc`, `src/manifest_parser_test.cc` and `misc/output_test.py`.
 
 ## Compatibility
 
 A build file written for this branch must load and build correctly under a stock ninja.
 `early_output_prefix` satisfies that when it is set on the `build` statement (stock ninja accepts unknown
 variables there, and rejects them on a `rule`): a stock ninja ignores it and releases all of an edge's
-outputs when the command exits. A generator should detect the feature by behaviour rather than by version —
-run a one-edge build whose command prints the prefix and see whether ninja removed the line from the output.
+outputs when the command exits.
+
+Nothing needs to detect which ninja is running. This ninja passes the prefix to the command in the
+environment variable `NINJA_EARLY_OUTPUT_PREFIX`, only for edges whose announcements it reads; a command
+announces if and only if the variable is set, using the value it holds. Under a stock ninja the variable is
+absent and the command prints nothing extra.
 
 ## Keeping the branch up to date
 

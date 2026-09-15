@@ -214,8 +214,13 @@ bool Plan::EdgeFinished(Edge* edge, EdgeResult result, string* err) {
     builder_->jobserver_->Release(std::move(edge->job_slot_));
 
   // The rest of this function only applies to successful commands.
-  if (result != kEdgeSucceeded)
+  if (result != kEdgeSucceeded) {
+    // Take back what the command announced: an edge that has not started by
+    // now must not start on an output of a failed command.
+    for (Node* output : edge->outputs_)
+      output->set_ready_early(false);
     return true;
+  }
 
   if (directly_wanted)
     --wanted_edges_;
@@ -223,7 +228,7 @@ bool Plan::EdgeFinished(Edge* edge, EdgeResult result, string* err) {
   edge->outputs_ready_ = true;
 
   // Load dyndep info provided by this edge's outputs.
-  if (builder_ && !builder_->LoadDyndeps(edge, err)) {
+  if (builder_ && !builder_->LoadDyndeps(edge->outputs_, err)) {
     return false;
   }
 
@@ -236,11 +241,13 @@ bool Plan::EdgeFinished(Edge* edge, EdgeResult result, string* err) {
   return true;
 }
 
-bool Plan::OutputReadyEarly(Edge* edge, Node* node, string* err) {
-  assert(node->in_edge() == edge);
-  (void)edge;
+bool Plan::EarlyOutputReady(Node* node, string* err) {
   if (node->ready_early())
     return true;
+  // As in EdgeFinished: dyndep information must be loaded before the edges
+  // it describes can be scheduled.
+  if (builder_ && !builder_->LoadDyndeps(vector<Node*>(1, node), err))
+    return false;
   node->set_ready_early(true);
   return NodeFinished(node, err);
 }
@@ -283,6 +290,12 @@ bool Plan::CleanNode(DependencyScan* scan, Node* node, string* err) {
     // Don't process edges that we don't actually want.
     map<Edge*, Want>::iterator want_e = want_.find(*oe);
     if (want_e == want_.end() || want_e->second == kWantNothing)
+      continue;
+
+    // An edge that was already scheduled -- possible only when |node| was an
+    // early output, released before its command finished and this restat
+    // happened -- runs to completion: it may be queued, running or done.
+    if (want_e->second == kWantToFinish)
       continue;
 
     // Don't attempt to clean an edge if it failed to load deps.
@@ -800,23 +813,11 @@ ExitStatus Builder::Build(string* err) {
         status_->BuildFinished();
         *err = "interrupted by user";
         return result.exit_status();
-      } else if (result.outputs_ready()) {
-        // The command keeps running (and keeps its job slot); only the
-        // announced outputs are released to the edges that consume them.
-        BuildResult::OutputsReady& ready = result.GetOutputsReady();
-        for (std::string& path : ready.paths) {
-          uint64_t slash_bits;
-          CanonicalizePath(&path, &slash_bits);
-          for (Node* output : ready.edge->outputs_) {
-            if (output->path() != path)
-              continue;
-            if (!plan_.OutputReadyEarly(ready.edge, output, err)) {
-              Cleanup();
-              status_->BuildFinished();
-              return ExitFailure;
-            }
-            break;
-          }
+      } else if (result.early_outputs()) {
+        if (!EarlyOutputsReady(result.GetEarlyOutputs(), err)) {
+          Cleanup();
+          status_->BuildFinished();
+          return ExitFailure;
         }
       } else if (result.command_completed()) {
         // We know that the result is from a completed command
@@ -930,6 +931,37 @@ bool Builder::StartEdge(Edge* edge, string* err) {
     return false;
   }
 
+  return true;
+}
+
+bool Builder::EarlyOutputsReady(BuildResult::EarlyOutputs& result,
+                                string* err) {
+  // The command keeps running, and keeps its job slot; only the outputs it
+  // announced are released to the edges that consume them.
+  for (string& path : result.paths) {
+    const string announced = path;
+    uint64_t slash_bits;
+    CanonicalizePath(&path, &slash_bits);
+    Node* node = state_->LookupNode(path);
+    if (!node || node->in_edge() != result.edge) {
+      status_->Warning(
+          "command announced '%s', which is not one of its outputs: %s",
+          announced.c_str(), result.edge->outputs_[0]->path().c_str());
+      continue;
+    }
+    // Ask the disk, not the node: the node's cached state is what Cleanup()
+    // compares against to find the outputs an interrupted command touched.
+    TimeStamp mtime = disk_interface_->Stat(node->path(), err);
+    if (mtime == -1)
+      return false;
+    if (mtime == 0) {
+      status_->Warning("command announced '%s', which does not exist",
+                       announced.c_str());
+      continue;
+    }
+    if (!plan_.EarlyOutputReady(node, err))
+      return false;
+  }
   return true;
 }
 
@@ -1120,11 +1152,10 @@ bool Builder::ExtractDeps(BuildResult::CommandCompleted& result,
   return true;
 }
 
-bool Builder::LoadDyndeps(Edge* edge, string* err) {
-  // Load the dyndep information provided by this edge's outputs.
+bool Builder::LoadDyndeps(const vector<Node*>& nodes, string* err) {
   std::vector<Node*> dyndep_nodes;
   std::unordered_map<Edge*, Dyndeps> dyndep_edges;
-  for (Node* node : edge->outputs_) {
+  for (Node* node : nodes) {
     if (node->dyndep_pending()) {
       // Load the dyndep information provided by this now-clean node.
       DyndepFile ddf;

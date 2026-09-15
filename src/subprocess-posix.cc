@@ -41,9 +41,42 @@ namespace {
   ExitStatus ParseExitStatus(int status);
 }
 
-Subprocess::Subprocess(bool use_console) : fd_(-1), pid_(-1),
-                                           use_console_(use_console) {
-}
+namespace {
+
+/// The environment of a subprocess: ninja's own, except that
+/// kEarlyOutputPrefixEnvVar holds the edge's prefix, or is absent when the
+/// edge has none -- also when ninja itself inherited one, being the command of
+/// another ninja: that request was addressed to ninja, not to its commands.
+struct SubprocessEnvironment {
+  explicit SubprocessEnvironment(const string& early_output_prefix) {
+    if (early_output_prefix.empty() && !getenv(kEarlyOutputPrefixEnvVar))
+      return;
+    const size_t name_len = strlen(kEarlyOutputPrefixEnvVar);
+    for (char** entry = environ; *entry; ++entry) {
+      if (strncmp(*entry, kEarlyOutputPrefixEnvVar, name_len) == 0 &&
+          (*entry)[name_len] == '=')
+        continue;
+      entries_.push_back(*entry);
+    }
+    if (!early_output_prefix.empty()) {
+      assignment_ = string(kEarlyOutputPrefixEnvVar) + "=" + early_output_prefix;
+      entries_.push_back(&assignment_[0]);
+    }
+    entries_.push_back(NULL);
+  }
+
+  char** get() { return entries_.empty() ? environ : &entries_[0]; }
+
+ private:
+  string assignment_;
+  vector<char*> entries_;
+};
+
+}  // namespace
+
+Subprocess::Subprocess(bool use_console, const string& early_output_prefix)
+    : early_output_parser_(early_output_prefix), fd_(-1), pid_(-1),
+      use_console_(use_console) {}
 
 Subprocess::~Subprocess() {
   if (fd_ >= 0)
@@ -130,8 +163,9 @@ bool Subprocess::Start(SubprocessSet* set, const string& command) {
     Fatal("posix_spawnattr_setflags: %s", strerror(err));
 
   const char* spawned_args[] = { "/bin/sh", "-c", command.c_str(), NULL };
+  SubprocessEnvironment environment(early_output_parser_.prefix());
   err = posix_spawn(&pid_, "/bin/sh", &action, &attr,
-        const_cast<char**>(spawned_args), environ);
+        const_cast<char**>(spawned_args), environment.get());
   if (err != 0)
     Fatal("posix_spawn: %s", strerror(err));
 
@@ -152,7 +186,7 @@ void Subprocess::OnPipeReady() {
   ssize_t len = read(fd_, buf, sizeof(buf));
   if (len > 0) {
     buf_.append(buf, len);
-    ExtractNotifications();
+    early_output_parser_.Parse(&buf_, &early_outputs_);
   } else {
     if (len < 0)
       Fatal("read: %s", strerror(errno));
@@ -311,9 +345,10 @@ SubprocessSet::~SubprocessSet() {
 }
 
 Subprocess *SubprocessSet::Add(const string& command, bool use_console,
-                               const string& notify_prefix) {
-  Subprocess *subprocess = new Subprocess(use_console);
-  subprocess->notify_prefix_ = notify_prefix;
+                               const string& early_output_prefix) {
+  // Ninja does not read the output of a console subprocess.
+  Subprocess *subprocess =
+      new Subprocess(use_console, use_console ? string() : early_output_prefix);
   if (!subprocess->Start(this, command)) {
     delete subprocess;
     return 0;
@@ -394,8 +429,8 @@ SubprocessSet::WorkResult SubprocessSet::DoWork() {
         work_result = WorkResult::SubprocFinished;
         continue;
       }
-      if ((*i)->HasNotifications() && work_result == WorkResult::NoWork)
-        work_result = WorkResult::OutputNotified;
+      if ((*i)->HasEarlyOutputs() && work_result == WorkResult::NoWork)
+        work_result = WorkResult::EarlyOutput;
     }
     ++i;
   }
@@ -463,8 +498,8 @@ SubprocessSet::WorkResult SubprocessSet::DoWork() {
         work_result = WorkResult::SubprocFinished;
         continue;
       }
-      if ((*i)->HasNotifications() && work_result == WorkResult::NoWork)
-        work_result = WorkResult::OutputNotified;
+      if ((*i)->HasEarlyOutputs() && work_result == WorkResult::NoWork)
+        work_result = WorkResult::EarlyOutput;
     }
     ++i;
   }

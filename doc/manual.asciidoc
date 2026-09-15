@@ -1076,17 +1076,40 @@ keys.
   needed when `deps = msvc` and no English Visual Studio version is used.
 
 `early_output_prefix`:: lets a command announce that some of its outputs
-  are complete before it exits.  Every line of the command's output that
-  starts with this string is removed from the output, and the rest of the
-  line is taken as the path of one of the edge's outputs that is now
-  complete; edges that consume it may start while the command keeps running
-  (it keeps its job slot until it exits).  A compiler that writes an
-  interface file early and an object file late -- `rustc` with its
-  `.rmeta` and `.rlib` -- lets its dependents start after the first.
-  The command must only announce a file that is completely written.  If the
-  command later fails the build fails as usual, and the next build reruns
-  it and everything that consumed the announced output.  Not available to
-  edges in the `console` pool, whose output Ninja does not read.
+  are complete before it exits, so that the edges consuming them can start
+  while the command keeps running (it keeps its job slot until it exits).
+  A compiler that writes an interface file early and an object file late --
+  `rustc` with its `.rmeta` and `.rlib` -- lets its dependents start after
+  the first.
++
+Every line of the command's output that starts with this string is removed
+from the output, and the rest of the line is taken as the path of an output
+of the edge that is now complete. The path is resolved like a path in the
+build file (relative to the build directory, `./` and `..` collapsed) and
+must name one of the edge's outputs exactly, and the file must exist;
+otherwise Ninja prints a warning and releases nothing. The command should
+write each announcement as one whole line, starting at the beginning of a
+line and ending in a newline, flushed when written, and only once the file
+is completely written and closed. A last line without its newline is not an
+announcement and stays in the output.
++
+Ninja passes the prefix to the command in the environment variable
+`NINJA_EARLY_OUTPUT_PREFIX`, and only to commands whose announcements it
+reads. A command should announce only when the variable is set, and with
+the value it holds: run by a Ninja without this feature, or in the
+`console` pool (whose output Ninja does not read), it then prints nothing
+extra.
++
+If the command fails after announcing, the build fails as usual: edges
+that were already started run to completion, edges that were not are not
+started, and the next build reruns the command and everything that
+consumed the announced output. A `restat` edge whose announced output
+turns out unchanged cannot cancel consumers that were already started. An
+announced `dyndep` file is loaded when it is announced.
++
+Older versions of Ninja reject this variable on a `rule` but accept and
+ignore it on a `build` statement, where a build file that must work with
+both should therefore put it.
 
 `description`:: a short description of the command, used to pretty-print
   the command as it's running.  The `-v` flag controls whether to print

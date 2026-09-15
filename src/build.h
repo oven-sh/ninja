@@ -72,9 +72,9 @@ struct Plan {
   /// Returns 'false' if loading dyndep info fails and 'true' otherwise.
   bool EdgeFinished(Edge* edge, EdgeResult result, std::string* err);
 
-  /// The still-running command of |edge| announced |node|, one of its
-  /// outputs, as complete: edges waiting only for it may start.
-  bool OutputReadyEarly(Edge* edge, Node* node, std::string* err);
+  /// The still-running command that produces |node| announced it as complete:
+  /// edges waiting only for it may start.
+  bool EarlyOutputReady(Node* node, std::string* err);
 
   /// Clean the given node during the build.
   /// Return false on error.
@@ -247,13 +247,19 @@ struct Builder {
   /// @return false if the build can not proceed further due to a fatal error.
   bool FinishCommand(BuildResult::CommandCompleted& result, std::string* err);
 
+  /// Release the outputs a running command announced (`early_output_prefix`)
+  /// to the edges that consume them.
+  bool EarlyOutputsReady(BuildResult::EarlyOutputs& result, std::string* err);
+
   /// Used for tests.
   void SetBuildLog(BuildLog* log) {
     scan_.set_build_log(log);
   }
 
   /// Load the dyndep information provided by the given edge's outputs.
-  bool LoadDyndeps(Edge* edge, std::string* err);
+  /// Load the dyndep information provided by those of |nodes| that carry
+  /// some, and update the plan.
+  bool LoadDyndeps(const std::vector<Node*>& nodes, std::string* err);
 
   State* state_;
   const BuildConfig& config_;

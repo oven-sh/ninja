@@ -169,6 +169,30 @@ class Output(unittest.TestCase):
             self.assertEqual(cm.exception.returncode, exit_code)
         self.assertEqual(expected, actual)
 
+    def test_early_output_prefix(self) -> None:
+        # The producer announces a.meta and then waits (bounded) for "b",
+        # which is built from a.meta: it can only succeed if Ninja starts
+        # b's command while the producer is still running.  The announcement
+        # line is removed from the output; the rest is kept.
+        plan = '''
+rule producer
+  command = touch a.meta && echo @ready@a.meta && i=0 && while [ ! -e b ] && [ $$i -lt 100 ]; do sleep 0.05; i=$$((i+1)); done && test -e b && echo kept && touch a.obj
+  early_output_prefix = @ready@
+  description = producer
+rule cp
+  command = cp $in $out
+  description = cp $out
+build a.meta a.obj: producer
+build b: cp a.meta
+build final: cp a.obj | b
+'''
+        self.assertEqual(run(plan, flags='-j2 final', pipe=True),
+'''[1/3] cp b
+[2/3] producer
+kept
+[3/3] cp final
+''')
+
     def test_issue_1418(self) -> None:
         self.assertEqual(run(
 '''rule echo

@@ -16,9 +16,9 @@
 #define NINJA_BUILD_RESULT_H_
 
 #include <string>
-#include <vector>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "exit_status.h"
 
@@ -42,11 +42,11 @@ struct BuildResult {
     constexpr bool success() const { return status == ExitSuccess; }
   };
 
-  /// A running command announced that some of its outputs are complete
-  struct OutputsReady {
+  /// A running command announced early outputs (see `early_output_prefix`)
+  struct EarlyOutputs {
     Edge* edge = nullptr;
+    /// As the command spelled them.
     std::vector<std::string> paths;
-    ExitStatus status = ExitSuccess;
   };
 
   /// Jobserver token became available while waiting for command
@@ -69,7 +69,7 @@ struct BuildResult {
   std::variant<
     std::monostate,
     CommandCompleted,
-    OutputsReady,
+    EarlyOutputs,
     JobserverTokenAvailable,
     Interrupted,
     Finished> state_;
@@ -98,8 +98,8 @@ struct BuildResult {
     return std::holds_alternative<JobserverTokenAvailable>(state_);
   }
 
-  constexpr bool outputs_ready() const {
-    return std::holds_alternative<OutputsReady>(state_);
+  constexpr bool early_outputs() const {
+    return std::holds_alternative<EarlyOutputs>(state_);
   }
 
   constexpr bool command_completed() const {
@@ -110,13 +110,14 @@ struct BuildResult {
   /// Dispatches based on the type of the internal state:
   ///
   /// 1. CommandCompleted: return the ExitStatus of the executed command
-  /// 2. JobserverTokenAvailable: consider this as a successful exit (no work done)
+  /// 2. JobserverTokenAvailable, EarlyOutputs: consider this as a successful
+  ///    exit (no work done)
   /// 3. Interrupted: return interrupted
   /// 4. Finished: consider this as a successful exit (no work done)
   constexpr ExitStatus exit_status() const {
     if (auto* cc = std::get_if<CommandCompleted>(&state_))
       return cc->status;
-    if (jobserver_token_available() || outputs_ready())
+    if (jobserver_token_available() || early_outputs())
       return ExitSuccess;
     if (interrupted())
       return ExitInterrupted;
@@ -130,8 +131,8 @@ struct BuildResult {
   /// using the above exit_status() function to retrieve the status
   constexpr bool success() const { return exit_status() == ExitSuccess; }
 
-  /// Note: runtime error to use this if outputs_ready() is false.
-  OutputsReady& GetOutputsReady() { return std::get<OutputsReady>(state_); }
+  /// Note: runtime error to use this if early_outputs() is false.
+  EarlyOutputs& GetEarlyOutputs() { return std::get<EarlyOutputs>(state_); }
 
   /// Note: runtime error to use this if command_completed() is false.
   constexpr CommandCompleted& GetCommandCompleted() {

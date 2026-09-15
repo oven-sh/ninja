@@ -24,10 +24,50 @@
 
 using namespace std;
 
-Subprocess::Subprocess(bool use_console) : child_(NULL) , overlapped_(),
-                                           is_reading_(false),
-                                           use_console_(use_console) {
+namespace {
+
+/// The environment block of a subprocess, or empty to inherit ninja's own
+/// unchanged: ninja's environment, except that kEarlyOutputPrefixEnvVar holds
+/// the edge's prefix, or is absent when the edge has none -- also when ninja
+/// itself inherited one, being the command of another ninja.
+string SubprocessEnvironmentBlock(const string& early_output_prefix) {
+  string block;
+  if (early_output_prefix.empty() &&
+      GetEnvironmentVariableA(kEarlyOutputPrefixEnvVar, NULL, 0) == 0)
+    return block;
+  const size_t name_len = strlen(kEarlyOutputPrefixEnvVar);
+  const string assignment =
+      string(kEarlyOutputPrefixEnvVar) + "=" + early_output_prefix;
+  bool pending = !early_output_prefix.empty();
+  char* strings = GetEnvironmentStringsA();
+  if (!strings)
+    Win32Fatal("GetEnvironmentStrings");
+  for (const char* entry = strings; *entry; entry += strlen(entry) + 1) {
+    // Entries starting with '=' are per-drive current directories.
+    if (entry[0] != '=') {
+      int order = _strnicmp(entry, kEarlyOutputPrefixEnvVar, name_len);
+      if (order == 0 && entry[name_len] == '=')
+        continue;
+      // The block is kept sorted by name, as CreateProcess documents it.
+      if (pending && order >= 0) {
+        block.append(assignment.c_str(), assignment.size() + 1);
+        pending = false;
+      }
+    }
+    block.append(entry, strlen(entry) + 1);
+  }
+  FreeEnvironmentStringsA(strings);
+  if (pending)
+    block.append(assignment.c_str(), assignment.size() + 1);
+  block.push_back('\0');
+  return block;
 }
+
+}  // namespace
+
+Subprocess::Subprocess(bool use_console, const string& early_output_prefix)
+    : early_output_parser_(early_output_prefix), child_(NULL), overlapped_(),
+      is_reading_(false), use_console_(use_console) {}
 
 Subprocess::~Subprocess() {
   if (pipe_) {
@@ -110,9 +150,10 @@ bool Subprocess::Start(SubprocessSet* set, const string& command) {
 
   // Do not prepend 'cmd /c' on Windows, this breaks command
   // lines greater than 8,191 chars.
+  string environment = SubprocessEnvironmentBlock(early_output_parser_.prefix());
   if (!CreateProcessA(NULL, (char*)command.c_str(), NULL, NULL,
                       /* inherit handles */ TRUE, process_flags,
-                      NULL, NULL,
+                      environment.empty() ? NULL : &environment[0], NULL,
                       &startup_info, &process_info)) {
     DWORD error = GetLastError();
     if (error == ERROR_FILE_NOT_FOUND) {
@@ -168,7 +209,7 @@ void Subprocess::OnPipeReady() {
 
   if (is_reading_ && bytes) {
     buf_.append(overlapped_buf_, bytes);
-    ExtractNotifications();
+    early_output_parser_.Parse(&buf_, &early_outputs_);
   }
 
   memset(&overlapped_, 0, sizeof(overlapped_));
@@ -241,9 +282,10 @@ BOOL WINAPI SubprocessSet::NotifyInterrupted(DWORD dwCtrlType) {
 }
 
 Subprocess *SubprocessSet::Add(const string& command, bool use_console,
-                               const string& notify_prefix) {
-  Subprocess *subprocess = new Subprocess(use_console);
-  subprocess->notify_prefix_ = notify_prefix;
+                               const string& early_output_prefix) {
+  // Ninja does not read the output of a console subprocess.
+  Subprocess *subprocess =
+      new Subprocess(use_console, use_console ? string() : early_output_prefix);
   if (!subprocess->Start(this, command)) {
     delete subprocess;
     return 0;
@@ -281,8 +323,8 @@ SubprocessSet::WorkResult SubprocessSet::DoWork() {
       running_.resize(end - running_.begin());
       work_result = WorkResult::SubprocFinished;
     }
-  } else if (subproc->HasNotifications()) {
-    work_result = WorkResult::OutputNotified;
+  } else if (subproc->HasEarlyOutputs()) {
+    work_result = WorkResult::EarlyOutput;
   }
 
   return work_result;
