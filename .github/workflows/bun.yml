@@ -1,0 +1,137 @@
+# Release binaries of this branch for the machines that build Bun.
+# See bun/README.md for what the branch is and how it is kept up to date.
+name: bun
+
+on:
+  pull_request:
+    branches: [bun]
+  push:
+    branches: [bun]
+    tags: ["bun-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    # Fully static (musl), so one binary per architecture runs on glibc and musl hosts alike.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      # `docker run` rather than `container:` — JavaScript actions do not run inside Alpine containers on arm64 runners.
+      - name: Build and test in Alpine
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.22 sh -euxc '
+            apk add --no-cache build-base cmake
+            cmake -B build-release -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_EXE_LINKER_FLAGS=-static -DCMAKE_COMPILE_WARNING_AS_ERROR=1
+            cmake --build build-release --parallel "$(nproc)"
+            ./build-release/ninja_test
+            ./build-release/ninja --version
+            strip build-release/ninja
+          '
+      - name: Archive
+        run: |
+          mkdir artifact
+          cd build-release && zip ../artifact/ninja-linux-${{ matrix.arch }}.zip ninja
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ninja-linux-${{ matrix.arch }}
+          path: artifact/ninja-linux-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  darwin:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+          - arch: aarch64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and test
+        run: |
+          cmake -B build-release -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_COMPILE_WARNING_AS_ERROR=1
+          cmake --build build-release --parallel "$(sysctl -n hw.ncpu)"
+          ./build-release/ninja_test
+          ./build-release/ninja --version
+          strip build-release/ninja
+      - name: Archive
+        run: |
+          mkdir artifact
+          cd build-release && zip ../artifact/ninja-darwin-${{ matrix.arch }}.zip ninja
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ninja-darwin-${{ matrix.arch }}
+          path: artifact/ninja-darwin-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+            cmake-arch: x64
+          - arch: aarch64
+            runner: windows-11-arm
+            cmake-arch: ARM64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and test
+        shell: pwsh
+        run: |
+          cmake -B build-release -A ${{ matrix.cmake-arch }} -DCMAKE_COMPILE_WARNING_AS_ERROR=1
+          cmake --build build-release --parallel --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\build-release\Release\ninja_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\build-release\Release\ninja.exe --version
+      - name: Archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory artifact | Out-Null
+          Compress-Archive -Path build-release\Release\ninja.exe -DestinationPath artifact\ninja-windows-${{ matrix.arch }}.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ninja-windows-${{ matrix.arch }}
+          path: artifact/ninja-windows-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  release:
+    # A `bun-*` tag publishes the six archives, with their checksums, as a GitHub release of that name.
+    if: startsWith(github.ref, 'refs/tags/bun-')
+    needs: [linux, darwin, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifact
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd artifact
+          sha256sum ninja-*.zip > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes "ninja for building Bun, built from the \`bun\` branch at $GITHUB_SHA. See bun/README.md." \
+            ninja-*.zip SHA256SUMS
