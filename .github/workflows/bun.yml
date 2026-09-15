@@ -1,5 +1,5 @@
-# Release binaries of this branch for the machines that build Bun.
-# See bun/README.md for what the branch is and how it is kept up to date.
+# Builds, tests and publishes this branch's ninja for the machines that build Bun.
+# See bun/README.md for what the branch is, what a release contains and how it is kept up to date.
 name: bun
 
 on:
@@ -7,15 +7,21 @@ on:
     branches: [bun]
   push:
     branches: [bun]
-    tags: ["bun-*"]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Every job builds CMake's Release configuration (-O3 / /O2, NDEBUG) and fails unless ninja's CMakeLists.txt
+# reported "IPO / LTO enabled", so a published binary is always the fully optimized one.
+#
+# Every archive holds the binary, ninja's license (COPYING, Apache-2.0: copies must carry it) and README.md (what
+# this build changes relative to upstream). The Linux binaries are linked statically against musl, whose MIT
+# license asks for its notice as well: COPYRIGHT.musl.
+
 jobs:
   linux:
-    # Fully static (musl), so one binary per architecture runs on glibc and musl hosts alike.
+    # Fully static, so one binary per architecture runs on glibc and musl hosts alike.
     strategy:
       fail-fast: false
       matrix:
@@ -31,9 +37,14 @@ jobs:
       - name: Build and test in Alpine
         run: |
           docker run --rm -v "$PWD:/src" -w /src alpine:3.22 sh -euxc '
+            set -o pipefail
             apk add --no-cache build-base cmake
+            # bun/licenses/musl-COPYRIGHT is the notice of the musl this links; keep the two in step.
+            apk list --installed | grep -q "^musl-1\.2\.5-" || { echo "Alpine ships a different musl: update bun/licenses/musl-COPYRIGHT and this check"; exit 1; }
             cmake -B build-release -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_EXE_LINKER_FLAGS=-static -DCMAKE_COMPILE_WARNING_AS_ERROR=1
+              -DCMAKE_EXE_LINKER_FLAGS=-static -DCMAKE_COMPILE_WARNING_AS_ERROR=1 2>&1 | tee configure.log
+            grep -q "IPO / LTO enabled" configure.log
+            grep -E "^CMAKE_(BUILD_TYPE|CXX_FLAGS_RELEASE):" build-release/CMakeCache.txt
             cmake --build build-release --parallel "$(nproc)"
             ./build-release/ninja_test
             ./build-release/ninja --version
@@ -41,12 +52,15 @@ jobs:
           '
       - name: Archive
         run: |
-          mkdir artifact
-          cd build-release && zip ../artifact/ninja-linux-${{ matrix.arch }}.zip ninja
+          mkdir -p stage artifact
+          cp build-release/ninja COPYING stage/
+          cp bun/README.md stage/README.md
+          cp bun/licenses/musl-COPYRIGHT stage/COPYRIGHT.musl
+          cd stage && zip ../artifact/bun-ninja-linux-${{ matrix.arch }}.zip ninja COPYING README.md COPYRIGHT.musl
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ninja-linux-${{ matrix.arch }}
-          path: artifact/ninja-linux-${{ matrix.arch }}.zip
+          name: bun-ninja-linux-${{ matrix.arch }}
+          path: artifact/bun-ninja-linux-${{ matrix.arch }}.zip
           if-no-files-found: error
 
   darwin:
@@ -63,20 +77,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build and test
         run: |
+          set -euxo pipefail
           cmake -B build-release -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_COMPILE_WARNING_AS_ERROR=1
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_COMPILE_WARNING_AS_ERROR=1 2>&1 | tee configure.log
+          grep -q "IPO / LTO enabled" configure.log
+          grep -E "^CMAKE_(BUILD_TYPE|CXX_FLAGS_RELEASE):" build-release/CMakeCache.txt
           cmake --build build-release --parallel "$(sysctl -n hw.ncpu)"
           ./build-release/ninja_test
           ./build-release/ninja --version
           strip build-release/ninja
       - name: Archive
         run: |
-          mkdir artifact
-          cd build-release && zip ../artifact/ninja-darwin-${{ matrix.arch }}.zip ninja
+          mkdir -p stage artifact
+          cp build-release/ninja COPYING stage/
+          cp bun/README.md stage/README.md
+          cd stage && zip ../artifact/bun-ninja-darwin-${{ matrix.arch }}.zip ninja COPYING README.md
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ninja-darwin-${{ matrix.arch }}
-          path: artifact/ninja-darwin-${{ matrix.arch }}.zip
+          name: bun-ninja-darwin-${{ matrix.arch }}
+          path: artifact/bun-ninja-darwin-${{ matrix.arch }}.zip
           if-no-files-found: error
 
   windows:
@@ -96,31 +115,40 @@ jobs:
       - name: Build and test
         shell: pwsh
         run: |
-          cmake -B build-release -A ${{ matrix.cmake-arch }} -DCMAKE_COMPILE_WARNING_AS_ERROR=1
-          cmake --build build-release --parallel --config Release
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\build-release\Release\ninja_test.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\build-release\Release\ninja.exe --version
+          $ErrorActionPreference = "Stop"
+          function Check { if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
+          # The Visual Studio generator is multi-config: the configuration is chosen at build time.
+          cmake -B build-release -A ${{ matrix.cmake-arch }} -DCMAKE_COMPILE_WARNING_AS_ERROR=1 2>&1 | Tee-Object configure.log; Check
+          if (-not (Select-String -Quiet -SimpleMatch "IPO / LTO enabled" configure.log)) { throw "LTO is not enabled" }
+          Select-String -Pattern "^CMAKE_CXX_FLAGS_RELEASE:" build-release\CMakeCache.txt | ForEach-Object Line
+          cmake --build build-release --parallel --config Release; Check
+          .\build-release\Release\ninja_test.exe; Check
+          .\build-release\Release\ninja.exe --version; Check
       - name: Archive
         shell: pwsh
         run: |
-          New-Item -ItemType Directory artifact | Out-Null
-          Compress-Archive -Path build-release\Release\ninja.exe -DestinationPath artifact\ninja-windows-${{ matrix.arch }}.zip
+          New-Item -ItemType Directory stage, artifact | Out-Null
+          Copy-Item build-release\Release\ninja.exe, COPYING stage\
+          Copy-Item bun\README.md stage\README.md
+          Compress-Archive -Path stage\* -DestinationPath artifact\bun-ninja-windows-${{ matrix.arch }}.zip
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ninja-windows-${{ matrix.arch }}
-          path: artifact/ninja-windows-${{ matrix.arch }}.zip
+          name: bun-ninja-windows-${{ matrix.arch }}
+          path: artifact/bun-ninja-windows-${{ matrix.arch }}.zip
           if-no-files-found: error
 
   release:
-    # A `bun-*` tag publishes the six archives, with their checksums, as a GitHub release of that name.
-    if: startsWith(github.ref, 'refs/tags/bun-')
+    # Every commit on `bun` is published as the release `bun-ninja-<first 8 hex digits of the commit>`: the six
+    # archives and bun-ninja.json, which records what they were built from and their checksums.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/bun'
     needs: [linux, darwin, windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: artifact
@@ -129,9 +157,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          tag="bun-ninja-${GITHUB_SHA::8}"
+          # The upstream commit this build sits on: where `bun` last merged ninja-build/ninja's master.
+          git fetch --quiet https://github.com/ninja-build/ninja master
+          upstream="$(git merge-base HEAD FETCH_HEAD)"
           cd artifact
-          sha256sum ninja-*.zip > SHA256SUMS
-          cat SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
-            --notes "ninja for building Bun, built from the \`bun\` branch at $GITHUB_SHA. See bun/README.md." \
-            ninja-*.zip SHA256SUMS
+          unzip -q -o bun-ninja-linux-x64.zip ninja -d probe
+          version="$(./probe/ninja --version)"
+          rm -rf probe
+          assets="$(for zip in bun-ninja-*.zip; do
+            jq -n --arg name "$zip" --arg sha256 "$(sha256sum "$zip" | cut -d' ' -f1)" '{($name): {sha256: $sha256}}'
+          done | jq -s add)"
+          jq -n --arg tag "$tag" --arg commit "$GITHUB_SHA" --arg upstream "$upstream" --arg version "$version" \
+            --argjson assets "$assets" \
+            '{tag: $tag, commit: $commit, upstream: $upstream, version: $version, assets: $assets}' > bun-ninja.json
+          cat bun-ninja.json
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # a re-run for the same commit: replace the assets
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber bun-ninja-*.zip bun-ninja.json
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" \
+              --notes "ninja $version for building Bun, built from $GITHUB_SHA (upstream ninja at $upstream) by .github/workflows/bun.yml. One archive per build host: bun-ninja-<os>-<arch>.zip; bun-ninja.json records what they were built from and their sha256." \
+              bun-ninja-*.zip bun-ninja.json
+          fi
