@@ -46,10 +46,10 @@ build Bun:
 | `ninja-darwin-x64.zip`, `ninja-darwin-aarch64.zip` | macOS | deployment target 11.0 |
 | `ninja-windows-x64.zip`, `ninja-windows-aarch64.zip` | Windows, MSVC | |
 
-Actions in that workflow are pinned to full commit SHAs, which the oven-sh organization requires; upstream's
-own workflows (`linux.yml`, `macos.yml`, `windows.yml`) use version tags and therefore fail on this fork —
-they are left untouched so that merging upstream stays free of conflicts, and their result is not meaningful
-here.
+Actions in that workflow are pinned to full commit SHAs, which the oven-sh organization requires. Upstream's
+own workflows (`linux.yml`, `macos.yml`, `windows.yml`, `linux-musl.yml`) use version tags and cannot run
+here; they are disabled in the fork's Actions settings rather than edited or deleted, so that merging
+upstream never conflicts on them. `bun.yml` builds and tests the same code on every host.
 
 Pushing a tag named `bun-<something>` publishes the six archives and a `SHA256SUMS` file as a GitHub release
 of that name.
