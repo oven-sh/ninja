@@ -63,7 +63,14 @@ struct Node {
     mtime_ = -1;
     exists_ = ExistenceStatusUnknown;
     dirty_ = false;
+    ready_early_ = false;
   }
+
+  /// True once the running command that produces this node has announced it
+  /// as complete (see the `early_output_prefix` binding), ahead of the
+  /// command's exit. Edges that consume it may start.
+  bool ready_early() const { return ready_early_; }
+  void set_ready_early(bool ready) { ready_early_ = ready; }
 
   /// Mark the Node as already-stat()ed and missing.
   void MarkMissing() {
@@ -151,6 +158,9 @@ private:
   /// But note that Edge::outputs_ready_ is also used in judging which
   /// edges to build.
   bool dirty_ = false;
+
+  /// Announced complete by its still-running command; see ready_early().
+  bool ready_early_ = false;
 
   /// Store whether dyndep information is expected from this node but
   /// has not yet been loaded.

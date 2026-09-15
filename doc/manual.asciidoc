@@ -1075,6 +1075,19 @@ keys.
   which should be stripped from msvc's /showIncludes output. Only
   needed when `deps = msvc` and no English Visual Studio version is used.
 
+`early_output_prefix`:: lets a command announce that some of its outputs
+  are complete before it exits.  Every line of the command's output that
+  starts with this string is removed from the output, and the rest of the
+  line is taken as the path of one of the edge's outputs that is now
+  complete; edges that consume it may start while the command keeps running
+  (it keeps its job slot until it exits).  A compiler that writes an
+  interface file early and an object file late -- `rustc` with its
+  `.rmeta` and `.rlib` -- lets its dependents start after the first.
+  The command must only announce a file that is completely written.  If the
+  command later fails the build fails as usual, and the next build reruns
+  it and everything that consumed the announced output.  Not available to
+  edges in the `console` pool, whose output Ninja does not read.
+
 `description`:: a short description of the command, used to pretty-print
   the command as it's running.  The `-v` flag controls whether to print
   the full command or its description; if a command fails, the full command

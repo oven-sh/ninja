@@ -16,6 +16,7 @@
 #define NINJA_BUILD_RESULT_H_
 
 #include <string>
+#include <vector>
 #include <utility>
 #include <variant>
 
@@ -41,6 +42,13 @@ struct BuildResult {
     constexpr bool success() const { return status == ExitSuccess; }
   };
 
+  /// A running command announced that some of its outputs are complete
+  struct OutputsReady {
+    Edge* edge = nullptr;
+    std::vector<std::string> paths;
+    ExitStatus status = ExitSuccess;
+  };
+
   /// Jobserver token became available while waiting for command
   struct JobserverTokenAvailable {
     ExitStatus status = ExitSuccess;
@@ -61,6 +69,7 @@ struct BuildResult {
   std::variant<
     std::monostate,
     CommandCompleted,
+    OutputsReady,
     JobserverTokenAvailable,
     Interrupted,
     Finished> state_;
@@ -89,6 +98,10 @@ struct BuildResult {
     return std::holds_alternative<JobserverTokenAvailable>(state_);
   }
 
+  constexpr bool outputs_ready() const {
+    return std::holds_alternative<OutputsReady>(state_);
+  }
+
   constexpr bool command_completed() const {
     return std::holds_alternative<CommandCompleted>(state_);
   }
@@ -103,7 +116,7 @@ struct BuildResult {
   constexpr ExitStatus exit_status() const {
     if (auto* cc = std::get_if<CommandCompleted>(&state_))
       return cc->status;
-    if (jobserver_token_available())
+    if (jobserver_token_available() || outputs_ready())
       return ExitSuccess;
     if (interrupted())
       return ExitInterrupted;
@@ -116,6 +129,9 @@ struct BuildResult {
   /// Returns true if the build succeeded (i.e. exited with ExitSuccess),
   /// using the above exit_status() function to retrieve the status
   constexpr bool success() const { return exit_status() == ExitSuccess; }
+
+  /// Note: runtime error to use this if outputs_ready() is false.
+  OutputsReady& GetOutputsReady() { return std::get<OutputsReady>(state_); }
 
   /// Note: runtime error to use this if command_completed() is false.
   constexpr CommandCompleted& GetCommandCompleted() {

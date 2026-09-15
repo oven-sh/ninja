@@ -236,6 +236,15 @@ bool Plan::EdgeFinished(Edge* edge, EdgeResult result, string* err) {
   return true;
 }
 
+bool Plan::OutputReadyEarly(Edge* edge, Node* node, string* err) {
+  assert(node->in_edge() == edge);
+  (void)edge;
+  if (node->ready_early())
+    return true;
+  node->set_ready_early(true);
+  return NodeFinished(node, err);
+}
+
 bool Plan::NodeFinished(Node* node, string* err) {
   // See if we we want any edges from this node.
   for (vector<Edge*>::const_iterator oe = node->out_edges().begin();
@@ -791,6 +800,24 @@ ExitStatus Builder::Build(string* err) {
         status_->BuildFinished();
         *err = "interrupted by user";
         return result.exit_status();
+      } else if (result.outputs_ready()) {
+        // The command keeps running (and keeps its job slot); only the
+        // announced outputs are released to the edges that consume them.
+        BuildResult::OutputsReady& ready = result.GetOutputsReady();
+        for (std::string& path : ready.paths) {
+          uint64_t slash_bits;
+          CanonicalizePath(&path, &slash_bits);
+          for (Node* output : ready.edge->outputs_) {
+            if (output->path() != path)
+              continue;
+            if (!plan_.OutputReadyEarly(ready.edge, output, err)) {
+              Cleanup();
+              status_->BuildFinished();
+              return ExitFailure;
+            }
+            break;
+          }
+        }
       } else if (result.command_completed()) {
         // We know that the result is from a completed command
         BuildResult::CommandCompleted& cc = result.GetCommandCompleted();

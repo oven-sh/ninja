@@ -85,7 +85,8 @@ bool Rule::IsReservedBinding(StringPiece var) {
       var == "restat" ||
       var == "rspfile" ||
       var == "rspfile_content" ||
-      var == "msvc_deps_prefix";
+      var == "msvc_deps_prefix" ||
+      var == "early_output_prefix";
 }
 
 const map<string, std::unique_ptr<const Rule>, StringPieceLess>& BindingEnv::GetRules() const {

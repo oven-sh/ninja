@@ -50,12 +50,50 @@ struct Subprocess {
 
   const std::string& GetOutput() const;
 
+  /// True if the command has announced outputs that have not been taken yet.
+  bool HasNotifications() const { return !notifications_.empty(); }
+  /// The paths announced since the last call.
+  std::vector<std::string> TakeNotifications() {
+    std::vector<std::string> taken;
+    taken.swap(notifications_);
+    return taken;
+  }
+
  private:
   Subprocess(bool use_console);
   bool Start(struct SubprocessSet* set, const std::string& command);
   void OnPipeReady();
 
+  /// Move every complete line of buf_ that starts with notify_prefix_ out of
+  /// the output and into notifications_ (without the prefix). Called after
+  /// each read; shared by the POSIX and Windows implementations.
+  void ExtractNotifications() {
+    if (notify_prefix_.empty())
+      return;
+    for (;;) {
+      size_t newline = buf_.find('\n', scan_pos_);
+      if (newline == std::string::npos)
+        return;
+      if (buf_.compare(scan_pos_, notify_prefix_.size(), notify_prefix_) == 0) {
+        size_t begin = scan_pos_ + notify_prefix_.size();
+        size_t end = newline;
+        if (end > begin && buf_[end - 1] == '\r')
+          --end;
+        notifications_.push_back(buf_.substr(begin, end - begin));
+        buf_.erase(scan_pos_, newline + 1 - scan_pos_);
+      } else {
+        scan_pos_ = newline + 1;
+      }
+    }
+  }
+
   std::string buf_;
+  /// Lines of output starting with this announce a finished output; empty
+  /// disables the scan.
+  std::string notify_prefix_;
+  /// Start of the first line of buf_ not yet examined.
+  size_t scan_pos_ = 0;
+  std::vector<std::string> notifications_;
 
 #ifdef _WIN32
   /// Set up pipe_ as the parent-side pipe of the subprocess; return the
@@ -111,15 +149,28 @@ struct SubprocessSet {
   enum class WorkResult {
     NoWork,
     JobserverTokenAvailable,
+    OutputNotified,
     SubprocFinished,
     Interrupted
   };
 
-  Subprocess* Add(const std::string& command, bool use_console = false);
+  /// \arg notify_prefix: if not empty, output lines starting with it announce
+  /// an output of the command that is complete before the command exits.
+  Subprocess* Add(const std::string& command, bool use_console = false,
+                  const std::string& notify_prefix = std::string());
   WorkResult DoWork();
 
   Subprocess* NextFinished();
   bool HasFinished() const { return !finished_.empty(); }
+  /// A running subprocess with announcements to take, or NULL.
+  Subprocess* NextNotified() const {
+    for (std::vector<Subprocess*>::const_iterator i = running_.begin();
+         i != running_.end(); ++i) {
+      if ((*i)->HasNotifications())
+        return *i;
+    }
+    return NULL;
+  }
   void Clear();
 
   std::vector<Subprocess*> running_;

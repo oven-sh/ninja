@@ -88,7 +88,8 @@ size_t RealCommandRunner::CanRunMore() const {
 
 bool RealCommandRunner::StartCommand(Edge* edge) {
   std::string command = edge->EvaluateCommand();
-  Subprocess* subproc = subprocs_.Add(command, edge->use_console());
+  Subprocess* subproc = subprocs_.Add(command, edge->use_console(),
+                                      edge->GetBinding("early_output_prefix"));
   if (!subproc)
     return false;
   subproc_to_edge_.insert(std::make_pair(subproc, edge));
@@ -111,14 +112,24 @@ BuildResult RealCommandRunner::WaitForCommandOrJobserverToken(
   }
 #endif
 
+  // Announcements are delivered before the completion of any command, so
+  // that they are never outlived by their subprocess.
   SubprocessSet::WorkResult work_result = SubprocessSet::WorkResult::NoWork;
-  if (subprocs_.HasFinished()) {
+  Subprocess* notified = subprocs_.NextNotified();
+  if (notified) {
+    work_result = SubprocessSet::WorkResult::OutputNotified;
+  } else if (subprocs_.HasFinished()) {
     work_result = SubprocessSet::WorkResult::SubprocFinished;
   }
 
   // Wait for DoWork() to report activity
   while (work_result == SubprocessSet::WorkResult::NoWork) {
     work_result = subprocs_.DoWork();
+    if (work_result == SubprocessSet::WorkResult::OutputNotified) {
+      notified = subprocs_.NextNotified();
+      if (!notified)
+        work_result = SubprocessSet::WorkResult::NoWork;
+    }
   }
 
   // Address interrupts first, then subprocesses finishing, then finally
@@ -141,6 +152,14 @@ BuildResult RealCommandRunner::WaitForCommandOrJobserverToken(
       delete subproc;
 
       build_result = BuildResult::CommandCompleted(edge, status, std::move(output));
+      break;
+    }
+    case SubprocessSet::WorkResult::OutputNotified:
+    {
+      BuildResult::OutputsReady ready;
+      ready.edge = subproc_to_edge_.find(notified)->second;
+      ready.paths = notified->TakeNotifications();
+      build_result = std::move(ready);
       break;
     }
     case SubprocessSet::WorkResult::JobserverTokenAvailable:

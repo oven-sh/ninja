@@ -196,6 +196,47 @@ TEST_F(SubprocessTest, Console) {
 
 #endif
 
+// Lines carrying the announce prefix are taken out of the output.
+TEST_F(SubprocessTest, NotificationsAreExtracted) {
+  Subprocess* subproc =
+      subprocs_.Add("echo @ready@out/a.meta", false, "@ready@");
+  ASSERT_NE((Subprocess*)0, subproc);
+  while (!subproc->Done())
+    subprocs_.DoWork();
+  ASSERT_EQ(ExitSuccess, subproc->Finish());
+  std::vector<std::string> notified = subproc->TakeNotifications();
+  ASSERT_EQ(1u, notified.size());
+  EXPECT_EQ("out/a.meta", notified[0]);
+  EXPECT_EQ("", subproc->GetOutput());
+}
+
+#ifndef _WIN32
+// An announcement is reported while the command is still running, and the
+// rest of the output is left alone.
+TEST_F(SubprocessTest, NotificationBeforeExit) {
+  Subprocess* subproc = subprocs_.Add(
+      "echo before; echo @ready@a.meta; echo not@ready@b; sleep 1; echo after",
+      false, "@ready@");
+  ASSERT_NE((Subprocess*)0, subproc);
+  SubprocessSet::WorkResult result = SubprocessSet::WorkResult::NoWork;
+  while (result != SubprocessSet::WorkResult::OutputNotified) {
+    ASSERT_FALSE(subproc->Done());
+    result = subprocs_.DoWork();
+  }
+  EXPECT_FALSE(subproc->Done());
+  EXPECT_EQ(subproc, subprocs_.NextNotified());
+  std::vector<std::string> notified = subproc->TakeNotifications();
+  ASSERT_EQ(1u, notified.size());
+  EXPECT_EQ("a.meta", notified[0]);
+  EXPECT_EQ((Subprocess*)0, subprocs_.NextNotified());
+
+  while (!subproc->Done())
+    subprocs_.DoWork();
+  ASSERT_EQ(ExitSuccess, subproc->Finish());
+  EXPECT_EQ("before\nnot@ready@b\nafter\n", subproc->GetOutput());
+}
+#endif
+
 TEST_F(SubprocessTest, SetWithSingle) {
   Subprocess* subproc = subprocs_.Add(kSimpleCommand);
   ASSERT_NE((Subprocess *) 0, subproc);

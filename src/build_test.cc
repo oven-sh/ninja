@@ -16,6 +16,7 @@
 
 #include <assert.h>
 #include <climits>
+#include <set>
 #include <stdint.h>
 
 #include "build_log.h"
@@ -530,6 +531,10 @@ struct FakeCommandRunner : public CommandRunner {
   virtual void Abort();
 
   vector<string> commands_ran_;
+  /// First output of each completed edge, in completion order.
+  vector<string> completed_;
+  /// Edges with an early_output_prefix that have announced their first output.
+  set<Edge*> announced_;
   vector<Edge*> active_edges_;
   size_t max_active_edges_;
   VirtualFileSystem* fs_;
@@ -762,6 +767,19 @@ BuildResult FakeCommandRunner::WaitForCommand() {
   if (active_edges_.empty())
     return BuildResult::Finished{};
 
+  // An edge with an early_output_prefix announces its first output once,
+  // and stays active.
+  for (vector<Edge*>::iterator e = active_edges_.begin();
+       e != active_edges_.end(); ++e) {
+    if (!(*e)->GetBinding("early_output_prefix").empty() &&
+        announced_.insert(*e).second) {
+      BuildResult::OutputsReady ready;
+      ready.edge = *e;
+      ready.paths.push_back((*e)->outputs_[0]->path());
+      return ready;
+    }
+  }
+
   // All active edges were already completed immediately when started,
   // so we can pick any edge here.  Pick the last edge.  Tests can
   // control the order of edges by the name of the first output.
@@ -828,6 +846,8 @@ BuildResult FakeCommandRunner::WaitForCommand() {
   }
 
   active_edges_.erase(edge_iter);
+  if (!edge->outputs_.empty())
+    completed_.push_back(edge->outputs_[0]->path());
   return BuildResult::CommandCompleted{edge, status, output};
 }
 
@@ -1553,6 +1573,48 @@ TEST_F(BuildTest, SwallowFailuresPool) {
   EXPECT_EQ(builder_.Build(&err), ExitFailure);
   ASSERT_EQ(3u, command_runner_.commands_ran_.size());
   ASSERT_EQ("cannot make progress due to previous errors", err);
+}
+
+// An output announced by a running command releases its consumers: "b"
+// (from a.meta) starts and completes while the command producing a.meta and
+// a.obj is still active; "final" waits for a.obj, i.e. for that command.
+TEST_F(BuildTest, EarlyOutputReleasesConsumers) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"build a.meta a.obj: cat in1\n"
+"  early_output_prefix = @ready@\n"
+"build b: cat a.meta\n"
+"build final: cat b a.obj\n"));
+  fs_.Create("in1", "");
+  command_runner_.max_active_edges_ = 2;
+
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("final", &err));
+  ASSERT_EQ("", err);
+  EXPECT_EQ(builder_.Build(&err), ExitSuccess);
+  ASSERT_EQ("", err);
+  ASSERT_EQ(3u, command_runner_.completed_.size());
+  EXPECT_EQ("b", command_runner_.completed_[0]);
+  EXPECT_EQ("a.meta", command_runner_.completed_[1]);
+  EXPECT_EQ("final", command_runner_.completed_[2]);
+}
+
+// Without the binding nothing is released early: same graph, "b" has to wait.
+TEST_F(BuildTest, NoEarlyOutputWithoutBinding) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"build a.meta a.obj: cat in1\n"
+"build b: cat a.meta\n"
+"build final: cat b a.obj\n"));
+  fs_.Create("in1", "");
+  command_runner_.max_active_edges_ = 2;
+
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("final", &err));
+  ASSERT_EQ("", err);
+  EXPECT_EQ(builder_.Build(&err), ExitSuccess);
+  ASSERT_EQ(3u, command_runner_.completed_.size());
+  EXPECT_EQ("a.meta", command_runner_.completed_[0]);
+  EXPECT_EQ("b", command_runner_.completed_[1]);
+  EXPECT_EQ("final", command_runner_.completed_[2]);
 }
 
 TEST_F(BuildTest, PoolEdgesReadyButNotWanted) {

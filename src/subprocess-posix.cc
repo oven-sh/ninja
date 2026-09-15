@@ -152,6 +152,7 @@ void Subprocess::OnPipeReady() {
   ssize_t len = read(fd_, buf, sizeof(buf));
   if (len > 0) {
     buf_.append(buf, len);
+    ExtractNotifications();
   } else {
     if (len < 0)
       Fatal("read: %s", strerror(errno));
@@ -309,8 +310,10 @@ SubprocessSet::~SubprocessSet() {
     Fatal("sigprocmask: %s", strerror(errno));
 }
 
-Subprocess *SubprocessSet::Add(const string& command, bool use_console) {
+Subprocess *SubprocessSet::Add(const string& command, bool use_console,
+                               const string& notify_prefix) {
   Subprocess *subprocess = new Subprocess(use_console);
+  subprocess->notify_prefix_ = notify_prefix;
   if (!subprocess->Start(this, command)) {
     delete subprocess;
     return 0;
@@ -391,6 +394,8 @@ SubprocessSet::WorkResult SubprocessSet::DoWork() {
         work_result = WorkResult::SubprocFinished;
         continue;
       }
+      if ((*i)->HasNotifications() && work_result == WorkResult::NoWork)
+        work_result = WorkResult::OutputNotified;
     }
     ++i;
   }
@@ -458,6 +463,8 @@ SubprocessSet::WorkResult SubprocessSet::DoWork() {
         work_result = WorkResult::SubprocFinished;
         continue;
       }
+      if ((*i)->HasNotifications() && work_result == WorkResult::NoWork)
+        work_result = WorkResult::OutputNotified;
     }
     ++i;
   }

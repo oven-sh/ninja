@@ -166,8 +166,10 @@ void Subprocess::OnPipeReady() {
     Win32Fatal("GetOverlappedResult");
   }
 
-  if (is_reading_ && bytes)
+  if (is_reading_ && bytes) {
     buf_.append(overlapped_buf_, bytes);
+    ExtractNotifications();
+  }
 
   memset(&overlapped_, 0, sizeof(overlapped_));
   is_reading_ = true;
@@ -238,8 +240,10 @@ BOOL WINAPI SubprocessSet::NotifyInterrupted(DWORD dwCtrlType) {
   return FALSE;
 }
 
-Subprocess *SubprocessSet::Add(const string& command, bool use_console) {
+Subprocess *SubprocessSet::Add(const string& command, bool use_console,
+                               const string& notify_prefix) {
   Subprocess *subprocess = new Subprocess(use_console);
+  subprocess->notify_prefix_ = notify_prefix;
   if (!subprocess->Start(this, command)) {
     delete subprocess;
     return 0;
@@ -277,6 +281,8 @@ SubprocessSet::WorkResult SubprocessSet::DoWork() {
       running_.resize(end - running_.begin());
       work_result = WorkResult::SubprocFinished;
     }
+  } else if (subproc->HasNotifications()) {
+    work_result = WorkResult::OutputNotified;
   }
 
   return work_result;

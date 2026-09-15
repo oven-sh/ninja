@@ -72,6 +72,10 @@ struct Plan {
   /// Returns 'false' if loading dyndep info fails and 'true' otherwise.
   bool EdgeFinished(Edge* edge, EdgeResult result, std::string* err);
 
+  /// The still-running command of |edge| announced |node|, one of its
+  /// outputs, as complete: edges waiting only for it may start.
+  bool OutputReadyEarly(Edge* edge, Node* node, std::string* err);
+
   /// Clean the given node during the build.
   /// Return false on error.
   bool CleanNode(DependencyScan* scan, Node* node, std::string* err);
