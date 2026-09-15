@@ -54,18 +54,6 @@ struct LazyEdgeCommandHash {
 
 /// Performance‑optimized helper class for recomputing the dirty state of
 /// outputs.
-///
-/// Strictly limited to the following usage:
-/*
- * {
- *   RecomputeOutputsDirtyCache cache(...);
- *   bool dirty = cache.all(most_recent_input);
- *
- *   // Optional fast follow‑up check after deps have been loaded
- *   if (!dirty && optional)
- *     dirty = cache.depfile(most_recent_input_other);
- * }
- */
 class RecomputeOutputsDirtyCache {
 
   /// Cached wrapper around BuildLog::LookupByOutput.
@@ -107,25 +95,9 @@ class RecomputeOutputsDirtyCache {
   /// - `false` if all outputs are clean
   bool all(const Node* most_recent_input);
 
-  /// Performs the same dirty‑checking logic as `all()`, but relies on cached
-  /// state produced during the preceding call to `all()`.
-  ///
-  /// Preconditions:
-  /// - `all(most_recent_input)` must have been called first and must have
-  ///   returned a false.
-  /// - The set and order of outputs in `edge_` must be unchanged.
-  ///
-  /// This function is intended as a fast follow‑up check once deps has been
-  /// loaded.
-  bool depfile(const Node* most_recent_input);
-
  private:
   /// Checks whether `output` of `edge_` is dirty.
-  /// @param FIRSTRUN  Indicates whether this is called from `all()` (true)
-  ///                  or from `depfile()` (false), enabling or disabling
-  ///                  certain checks accordingly.
   /// Returns true if dirty.
-  template <bool FIRSTRUN>
   bool RecomputeOutputDirty(const Node* output, const Node* most_recent_input,
                             CachedLogEntry& entry);
 
@@ -142,10 +114,6 @@ class RecomputeOutputsDirtyCache {
   bool generatorValid_ = false;
   std::vector<CachedLogEntry> logEntry_;
   LazyEdgeCommandHash commandHash_ = LazyEdgeCommandHash(edge_);
-
-#ifndef NDEBUG
-  std::vector<const Node*> checkOutputs_;
-#endif
 };
 
 bool RecomputeOutputsDirtyCache::CachedLogEntry::LookupByOutput(
@@ -160,31 +128,13 @@ bool RecomputeOutputsDirtyCache::CachedLogEntry::LookupByOutput(
 }
 
 bool RecomputeOutputsDirtyCache::all(const Node* most_recent_input) {
-  assert((checkOutputs_.assign(edge_->outputs_.begin(), edge_->outputs_.end()),
-          true));
-
   for (std::size_t i = 0; i != edge_->outputs_.size(); ++i) {
     const bool outputDirty =
         edge_->is_phony()
             ? Phony(edge_->outputs_[i], most_recent_input)
-            : RecomputeOutputDirty<true>(edge_->outputs_[i], most_recent_input,
-                                         logEntry_[i]);
+            : RecomputeOutputDirty(edge_->outputs_[i], most_recent_input,
+                                   logEntry_[i]);
     if (outputDirty)
-      return true;
-  }
-  return false;
-}
-
-bool RecomputeOutputsDirtyCache::depfile(const Node* most_recent_input) {
-  // Precondition: RecomputeOutputsDirtyCache::all() was previously called
-  // with the same edge_->outputs_ as used here.
-  assert(std::equal(checkOutputs_.begin(), checkOutputs_.end(),
-                    edge_->outputs_.begin()));
-
-  for (std::size_t i = 0; i != edge_->outputs_.size(); ++i) {
-    assert(!edge_->is_phony());
-    if (RecomputeOutputDirty<false>(edge_->outputs_[i], most_recent_input,
-                                    logEntry_[i]))
       return true;
   }
   return false;
@@ -214,15 +164,10 @@ bool RecomputeOutputsDirtyCache::Phony(Node* output,
   return false;
 }
 
-#define IF_FIRSTRUN(cond)                                     \
-  if constexpr (!FIRSTRUN) assert(!(cond));      /* NOLINT */ \
-  if constexpr (FIRSTRUN) if (cond)              /* NOLINT */
-
-template <bool FIRSTRUN>
 bool RecomputeOutputsDirtyCache::RecomputeOutputDirty(
     const Node* output, const Node* most_recent_input, CachedLogEntry& entry) {
   // Dirty if we're missing the output.
-  IF_FIRSTRUN (!output->exists()) {
+  if (!output->exists()) {
     explanations_.Record(output, "output %s doesn't exist",
                          output->path().c_str());
     return true;
@@ -252,12 +197,12 @@ bool RecomputeOutputsDirtyCache::RecomputeOutputDirty(
   }
 
   if (buildLog_) {
-    IF_FIRSTRUN (!generatorValid_) {
+    if (!generatorValid_) {
       generator_ = edge_->GetBindingBool("generator");
       generatorValid_ = true;
     }
     if (entry.LookupByOutput(buildLog_, output)) {
-      IF_FIRSTRUN (!generator_ && commandHash_() != entry->command_hash) {
+      if (!generator_ && commandHash_() != entry->command_hash) {
         // May also be dirty due to the command changing since the last build.
         // But if this is a generator rule, the command changing does not make
         // us dirty.
@@ -281,7 +226,7 @@ bool RecomputeOutputsDirtyCache::RecomputeOutputDirty(
         return true;
       }
     }
-    IF_FIRSTRUN (!entry.is_valid() && !generator_) {
+    if (!entry.is_valid() && !generator_) {
       explanations_.Record(output, "command line not found in log for %s",
                            output->path().c_str());
       return true;
@@ -435,7 +380,6 @@ bool DependencyScan::RecomputeNodeDirty(Node* node, std::vector<Node*>* stack,
   edge->outputs_ready_ = true;
   edge->deps_missing_ = false;
 
-  const bool edge_deps_loaded = edge->deps_loaded_;
   if (!edge->deps_loaded_) {
     // This is our first encounter with this edge.
     edge->deps_loaded_ = true;
@@ -461,6 +405,15 @@ bool DependencyScan::RecomputeNodeDirty(Node* node, std::vector<Node*>* stack,
           return false;
       }
     }
+
+    // Load discovered deps.
+    if (!dep_loader_.LoadDeps(edge, err)) {
+      if (!err->empty())
+        return false;
+      // Failed to load dependency info: rebuild to regenerate it.
+      // LoadDeps() did explanations_->Record() already, no need to do it here.
+      dirty = edge->deps_missing_ = true;
+    }
   }
 
   // Load output mtimes so we can compare them to the most recent input below.
@@ -485,40 +438,6 @@ bool DependencyScan::RecomputeNodeDirty(Node* node, std::vector<Node*>* stack,
                                                 edge);
   if (!dirty)
     dirty = recomputeOutputsDirty.all(most_recent_input);
-
-  if (!edge_deps_loaded) {
-    // only try to load the deps log if no rebuild is necessary
-    // if an rebuild is necessary the deps log is outdated for this target
-    if (!dirty) {
-      // Load discovered deps.
-      std::optional<EdgeInputsRange> new_deps = dep_loader_.LoadDeps(edge, err);
-      if (!new_deps) {
-        if (!err->empty())
-          return false;
-        // Failed to load dependency info: rebuild to regenerate it.
-        // LoadDeps() did explanations_->Record() already, no need to do it
-        // here.
-        dirty = edge->deps_missing_ = true;
-      } else {
-        // depfile load succeeded
-        // check the recently added inputs from depfile
-        const Node* most_recent_input_previous = most_recent_input;
-        if (!RecomputeEdgesInputsDirty(node, new_deps.value(), most_recent_input, dirty,
-                                       stack, validation_nodes, err))
-          return false;
-
-        // only applicable if most_recent_input did change, any other criteria
-        // has already been checked.
-        if (!dirty && most_recent_input_previous != most_recent_input)
-          dirty = recomputeOutputsDirty.depfile(most_recent_input);
-      }
-    } else if (!dep_loader_.LoadDepsTry(edge, err)) {
-      if (!err->empty())
-        return false;
-      else
-        dirty = edge->deps_missing_ = true;
-    }
-  }
 
   // Finally, visit each output and update their dirty state if necessary.
   if (dirty) {
@@ -854,19 +773,6 @@ std::optional<EdgeInputsRange> ImplicitDepLoader::LoadDeps(Edge* edge,
   return EdgeInputsRange::Empty(edge);
 }
 
-bool ImplicitDepLoader::LoadDepsTry(const Edge* edge, string* err) const {
-  string deps_type = edge->GetBinding("deps");
-  if (!deps_type.empty())
-    return LoadDepsFromLogTry(edge, err);
-
-  string depfile = edge->GetUnescapedDepfile();
-  if (!depfile.empty())
-    return LoadDepFileTry(edge, depfile, err);
-
-  // No deps to load.
-  return true;
-}
-
 struct matches {
   explicit matches(std::vector<StringPiece>::iterator i) : i_(i) {}
 
@@ -943,21 +849,6 @@ std::optional<EdgeInputsRange> ImplicitDepLoader::LoadDepFile(
   return ProcessDepfileDeps(edge, &depfile.ins_, err);
 }
 
-bool ImplicitDepLoader::LoadDepFileTry(const Edge* edge, const string& path,
-                                       string* err) const {
-  TimeStamp time_stamp = disk_interface_->Stat(path, err);
-
-  if (time_stamp > 0)
-    return true;
-  else if (time_stamp == 0) {
-    *err = "";
-    return false;
-  } else {
-    *err = "loading '" + path + "': " + *err;
-    return false;
-  }
-}
-
 std::optional<EdgeInputsRange> ImplicitDepLoader::ProcessDepfileDeps(
     Edge* edge, std::vector<StringPiece>* depfile_ins,
     std::string* err) {
@@ -1016,35 +907,6 @@ std::optional<EdgeInputsRange> ImplicitDepLoader::LoadDepsFromLog(Edge* edge,
 
   const auto begin = edge->inputs_.insert(implicit_dep, nodes, nodes + node_count);
   return EdgeInputsRange(edge, begin, begin + node_count);
-}
-
-bool ImplicitDepLoader::LoadDepsFromLogTry(const Edge* edge,
-                                           string* err) const {
-  // NOTE: deps are only supported for single-target edges.
-  Node* output = edge->outputs_[0];
-  DepsLog::Deps* deps = deps_log_ ? deps_log_->GetDeps(output) : NULL;
-  if (!deps) {
-    err->clear();
-    explanations_.Record(output, "deps for '%s' are missing",
-                         output->path().c_str());
-    return false;
-  }
-
-  // Load the output's mtime if we haven't already.
-  if (!output->StatIfNecessary(disk_interface_, err)) {
-    return false;
-  }
-
-  // Deps are invalid if the output is newer than the deps.
-  if (output->mtime() > deps->mtime) {
-    explanations_.Record(output,
-                         "stored deps info out of date for '%s' (%" PRId64
-                         " vs %" PRId64 ")",
-                         output->path().c_str(), deps->mtime, output->mtime());
-    return false;
-  }
-
-  return true;
 }
 
 vector<Node*>::iterator ImplicitDepLoader::PreallocateSpace(Edge* edge,

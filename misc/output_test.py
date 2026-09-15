@@ -169,6 +169,35 @@ class Output(unittest.TestCase):
             self.assertEqual(cm.exception.returncode, exit_code)
         self.assertEqual(expected, actual)
 
+    def test_restat_clean_input_does_not_hide_depfile_input(self) -> None:
+        # 'lib' depends on src.txt only through its recorded deps, and on gen.out
+        # through the manifest. Editing src.txt reruns the restat rule 'gen', which
+        # leaves gen.out alone; 'lib' must still be rebuilt in the same invocation.
+        plan = '''
+rule gen
+  command = test -f $out || echo x > $out
+  restat = 1
+rule cc
+  command = cat $in src.txt > $out && echo "$out: src.txt" > $out.d
+  depfile = $out.d
+  deps = gcc
+build gen.out: gen src.txt
+build lib: cc main.txt | gen.out
+'''
+        with BuildDir(plan) as b:
+            with open(os.path.join(b.path, 'main.txt'), 'w') as f:
+                f.write('m\n')
+            with open(os.path.join(b.path, 'src.txt'), 'w') as f:
+                f.write('1\n')
+            b.run()
+            time.sleep(1.1)  # a newer mtime on filesystems with one-second resolution
+            with open(os.path.join(b.path, 'src.txt'), 'w') as f:
+                f.write('2\n')
+            b.run()
+            with open(os.path.join(b.path, 'lib')) as f:
+                self.assertEqual(f.read(), 'm\n2\n')
+            self.assertEqual(b.run(), 'ninja: no work to do.\n')
+
     def test_early_output_prefix(self) -> None:
         # The producer announces a.meta and then waits (bounded) for "b",
         # which is built from a.meta: it can only succeed if Ninja starts
